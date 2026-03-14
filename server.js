@@ -10,9 +10,9 @@ const app = express();
 app.use(cors({
   origin: [
     'http://localhost:3000',
-    'http://localhost:5173', // Add this for Vite
-    'http://localhost:5174', // Add this in case Vite uses a different port
-    'https://acedu.vercel.app', // Replace with your actual Vercel URL
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'https://acedu.vercel.app',
     process.env.FRONTEND_URL
   ].filter(Boolean)
 }));
@@ -58,7 +58,28 @@ const initDb = async () => {
 };
 initDb();
 
-// GET all boxes
+// ============ AUTHENTICATION MIDDLEWARE ============
+const ADMIN_PASSWORD = 'the4memaker'; // Same password as in your frontend
+
+const authenticate = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  
+  const token = authHeader.split(' ')[1];
+  
+  // Simple password check (in production, use proper JWT tokens)
+  if (token !== ADMIN_PASSWORD) {
+    return res.status(403).json({ error: 'Invalid password' });
+  }
+  
+  next();
+};
+
+// ============ PUBLIC ROUTES ============
+// GET all boxes - PUBLIC (no authentication needed)
 app.get('/api/boxes', async (req, res) => {
   console.log('GET /api/boxes called');
   
@@ -80,21 +101,32 @@ app.get('/api/boxes', async (req, res) => {
   }
 });
 
-// POST new box
-// POST new box
-app.post('/api/boxes', async (req, res) => {
+// Health check - PUBLIC
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Root endpoint - PUBLIC
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'School Backend API',
+    endpoints: ['/api/boxes', '/api/delete-cloudinary-image', '/health']
+  });
+});
+
+// ============ PROTECTED ROUTES (require authentication) ============
+// POST new box - PROTECTED
+app.post('/api/boxes', authenticate, async (req, res) => {
   console.log('📥 POST /api/boxes received!');
-  console.log('Request body:', req.body); // Debug: see what's coming in
+  console.log('Request body:', req.body);
   
   const box = req.body;
   
-  // Check if box exists
   if (!box) {
     console.error('❌ No box data received');
     return res.status(400).json({ error: 'No box data received' });
   }
   
-  // Check if required fields exist
   if (!box.imageUrl) {
     console.error('❌ Missing imageUrl');
     return res.status(400).json({ error: 'imageUrl is required' });
@@ -115,8 +147,9 @@ app.post('/api/boxes', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-// PUT update box
-app.put('/api/boxes/:id', async (req, res) => {
+
+// PUT update box - PROTECTED
+app.put('/api/boxes/:id', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
       'UPDATE boxes SET data = $1 WHERE id = $2 RETURNING id',
@@ -134,8 +167,8 @@ app.put('/api/boxes/:id', async (req, res) => {
   }
 });
 
-// DELETE box
-app.delete('/api/boxes/:id', async (req, res) => {
+// DELETE box - PROTECTED
+app.delete('/api/boxes/:id', authenticate, async (req, res) => {
   console.log('Deleting ID:', req.params.id);
   
   try {
@@ -155,8 +188,8 @@ app.delete('/api/boxes/:id', async (req, res) => {
   }
 });
 
-// Cloudinary image deletion
-app.post('/api/delete-cloudinary-image', async (req, res) => {
+// Cloudinary image deletion - PROTECTED (should also require auth)
+app.post('/api/delete-cloudinary-image', authenticate, async (req, res) => {
   const { publicId } = req.body;
 
   console.log('Received Cloudinary delete request for publicId:', publicId);
@@ -196,25 +229,11 @@ app.post('/api/delete-cloudinary-image', async (req, res) => {
   }
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Root endpoint
-app.get('/', (req, res) => {
-  res.json({ 
-    message: 'School Backend API',
-    endpoints: ['/api/boxes', '/api/delete-cloudinary-image', '/health']
-  });
-});
-
 // Start server
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`✅ Backend running on http://localhost:${PORT}`);
   console.log(`   Cloudinary cloud: ${cloudinary.config().cloud_name}`);
   console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`   🔒 Protected routes require authentication`);
 });
-
-
