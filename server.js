@@ -25,25 +25,53 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET || 'JeytQ7MopgskaUIDXYDdfR5Co_k'
 });
 
-// PostgreSQL connection pool
+// ============ NEON DATABASE CONFIGURATION ============
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  ssl: { rejectUnauthorized: false },
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+  max: 20,
 });
 
-// Test database connection
-pool.connect((err, client, release) => {
-  if (err) {
-    console.error('Error connecting to PostgreSQL:', err.stack);
-  } else {
-    console.log('✅ Connected to PostgreSQL database');
-    release();
+// Test database connection with retry logic
+const testConnection = async (retries = 3) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const client = await pool.connect();
+      console.log('✅ Connected to Neon PostgreSQL database');
+      client.release();
+      return true;
+    } catch (err) {
+      console.error(`Connection attempt ${i + 1} failed:`, err.message);
+      if (i === retries - 1) return false;
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
   }
-});
+  return false;
+};
 
-// Create tables if they don't exist
+// Create tables - FIXED VERSION
 const initDb = async () => {
   try {
+    const isConnected = await testConnection();
+    if (!isConnected) {
+      console.error('❌ Cannot initialize database - no connection');
+      return;
+    }
+
+    // First, remove the site_id column if it exists
+    try {
+      await pool.query(`
+        ALTER TABLE boxes DROP COLUMN IF EXISTS site_id;
+      `);
+      console.log('✅ Removed site_id column if it existed');
+    } catch (err) {
+      // Table might not exist yet, that's fine
+      console.log('Note:', err.message);
+    }
+
+    // Create or update table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS boxes (
         id TEXT PRIMARY KEY,
@@ -51,15 +79,21 @@ const initDb = async () => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    console.log('✅ Database tables initialized');
+    
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_boxes_created_at ON boxes(created_at)
+    `);
+    
+    console.log('✅ Database tables initialized successfully');
   } catch (err) {
-    console.error('Error initializing database:', err);
+    console.error('❌ Error initializing database:', err.message);
   }
 };
+
 initDb();
 
 // ============ AUTHENTICATION MIDDLEWARE ============
-const ADMIN_PASSWORD = 'the4memaker'; // Same password as in your frontend
+const ADMIN_PASSWORD = 'the4memaker';
 
 const authenticate = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -70,7 +104,6 @@ const authenticate = (req, res, next) => {
   
   const token = authHeader.split(' ')[1];
   
-  // Simple password check (in production, use proper JWT tokens)
   if (token !== ADMIN_PASSWORD) {
     return res.status(403).json({ error: 'Invalid password' });
   }
@@ -79,7 +112,6 @@ const authenticate = (req, res, next) => {
 };
 
 // ============ PUBLIC ROUTES ============
-// GET all boxes - PUBLIC (no authentication needed)
 app.get('/api/boxes', async (req, res) => {
   console.log('GET /api/boxes called');
   
@@ -96,39 +128,33 @@ app.get('/api/boxes', async (req, res) => {
     console.log(`Returning ${boxes.length} boxes`);
     res.json(boxes);
   } catch (err) {
-    console.error('Database error:', err);
+    console.error('Database error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Health check - PUBLIC
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Root endpoint - PUBLIC
 app.get('/', (req, res) => {
   res.json({ 
-    message: 'School Backend API',
+    message: 'School Backend API (Neon PostgreSQL)',
     endpoints: ['/api/boxes', '/api/delete-cloudinary-image', '/health']
   });
 });
 
-// ============ PROTECTED ROUTES (require authentication) ============
-// POST new box - PROTECTED
+// ============ PROTECTED ROUTES ============
 app.post('/api/boxes', authenticate, async (req, res) => {
   console.log('📥 POST /api/boxes received!');
-  console.log('Request body:', req.body);
   
   const box = req.body;
   
   if (!box) {
-    console.error('❌ No box data received');
     return res.status(400).json({ error: 'No box data received' });
   }
   
   if (!box.imageUrl) {
-    console.error('❌ Missing imageUrl');
     return res.status(400).json({ error: 'imageUrl is required' });
   }
   
@@ -143,12 +169,11 @@ app.post('/api/boxes', authenticate, async (req, res) => {
     console.log('✅ Box saved with ID:', id);
     res.json({ ...boxData, id });
   } catch (err) {
-    console.error('❌ Insert error:', err);
+    console.error('❌ Insert error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// PUT update box - PROTECTED
 app.put('/api/boxes/:id', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -162,12 +187,11 @@ app.put('/api/boxes/:id', authenticate, async (req, res) => {
     
     res.json(req.body);
   } catch (err) {
-    console.error('Update error:', err);
+    console.error('Update error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// DELETE box - PROTECTED
 app.delete('/api/boxes/:id', authenticate, async (req, res) => {
   console.log('Deleting ID:', req.params.id);
   
@@ -183,50 +207,43 @@ app.delete('/api/boxes/:id', authenticate, async (req, res) => {
     
     res.json({ message: 'Box deleted', id: req.params.id });
   } catch (err) {
-    console.error('Delete error:', err);
+    console.error('Delete error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Cloudinary image deletion - PROTECTED (should also require auth)
 app.post('/api/delete-cloudinary-image', authenticate, async (req, res) => {
   const { publicId } = req.body;
 
-  console.log('Received Cloudinary delete request for publicId:', publicId);
-
   if (!publicId) {
-    console.error('No publicId provided');
     return res.status(400).json({ error: 'publicId is required' });
   }
 
   try {
-    console.log(`Attempting to delete Cloudinary image: ${publicId}`);
-    console.log('Cloudinary config:', {
-      cloud_name: cloudinary.config().cloud_name,
-      api_key_exists: !!cloudinary.config().api_key
-    });
-    
     const result = await cloudinary.uploader.destroy(publicId);
-    console.log('Cloudinary destroy result:', JSON.stringify(result, null, 2));
     
-    if (result.result === 'ok') {
-      console.log('✅ Cloudinary image deleted successfully');
-      return res.json({ success: true, result: result.result });
-    } else if (result.result === 'not found') {
-      console.log('⚠️ Cloudinary image not found (already deleted?)');
+    if (result.result === 'ok' || result.result === 'not found') {
       return res.json({ success: true, result: result.result });
     } else {
-      console.error('❌ Cloudinary deletion failed with result:', result);
       return res.status(500).json({ error: 'Cloudinary deletion failed', result });
     }
   } catch (err) {
-    console.error('❌ Cloudinary error details:', {
-      message: err.message,
-      stack: err.stack,
-      name: err.name
-    });
+    console.error('Cloudinary error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM signal received: closing HTTP server');
+  await pool.end();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT signal received: closing HTTP server');
+  await pool.end();
+  process.exit(0);
 });
 
 // Start server
@@ -235,5 +252,6 @@ app.listen(PORT, () => {
   console.log(`✅ Backend running on http://localhost:${PORT}`);
   console.log(`   Cloudinary cloud: ${cloudinary.config().cloud_name}`);
   console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`   Database: Neon PostgreSQL`);
   console.log(`   🔒 Protected routes require authentication`);
 });
